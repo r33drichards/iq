@@ -27,13 +27,12 @@ async fn get_instance_id(state: &State<Mutex<AppState>>) -> Result<String, &'sta
     let instance_id: Option<String> = conn.lpop("ec2_instance_queue", NonZeroUsize::new(1)).await.expect("Failed to pop from Redis");
 
     if let Some(id) = instance_id {
-        // Asynchronously create and enqueue a new instance if below desired size
+        // Asynchronously create and enqueue a new instance
         let current_size: usize = conn.llen("ec2_instance_queue").await.expect("Failed to get queue length");
         if current_size < state.desired_queue_size {
             tokio::spawn(create_and_enqueue_ec2_instance(
                 state.ec2_client.clone(),
                 client,
-                state.desired_queue_size,
                 state.launch_template_id.clone(),
             ));
         }
@@ -47,7 +46,6 @@ async fn get_instance_id(state: &State<Mutex<AppState>>) -> Result<String, &'sta
 async fn create_and_enqueue_ec2_instance(
     ec2_client: Ec2Client,
     redis_client: redis::Client,
-    desired_queue_size: usize,
     launch_template_id: String,
 ) {
     let request = RunInstancesRequest {
@@ -76,14 +74,16 @@ async fn create_and_enqueue_ec2_instance(
 fn rocket() -> _ {
     dotenv().ok();
 
-    let redis_url = env::var("REDIS_URL").expect("REDIS_URL must be set");
+    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "localhost:6379".to_string());
     let ec2_client = Ec2Client::new(Region::default());
     let desired_queue_size: usize = env::var("DESIRED_QUEUE_SIZE")
         .unwrap_or_else(|_| "5".to_string())
         .parse()
         .expect("DESIRED_QUEUE_SIZE must be a valid number");
-    let launch_template_id = env::var("LAUNCH_TEMPLATE_ID").expect("LAUNCH_TEMPLATE_ID must be set");
-
+    let launch_template_id = env::var("LAUNCH_TEMPLATE_ID").unwrap_or_else(|_| "lt-0d7b76529ceabcb50".to_string());
+    // todo seed queue to desired size if less than desired size
+    // or reduce queue to desired size if greater than desired size
+    let current_queue_size = 
     rocket::build()
         .manage(Mutex::new(AppState {
             ec2_client,
@@ -91,5 +91,5 @@ fn rocket() -> _ {
             desired_queue_size,
             launch_template_id,
         }))
-        .mount("/", routes![get_instance_id])
+        .mount("/", routes![get_instance_id]);
 }
