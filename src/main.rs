@@ -1,10 +1,12 @@
 #[macro_use]
 extern crate rocket;
-
 use dotenv::dotenv;
 use redis::AsyncCommands;
 use redis::Commands;
 use rocket::State;
+use rocket_okapi::{openapi, openapi_get_routes, rapidoc::*, swagger_ui::*};
+use rocket_okapi::swagger_ui::make_swagger_ui;
+use rocket_okapi::settings::UrlObject;
 use rusoto_core::Region;
 use rusoto_ec2::{Ec2, Ec2Client, RunInstancesRequest};
 use std::env;
@@ -16,7 +18,10 @@ struct AppState {
     desired_queue_size: usize,
     launch_template_id: String, // Launch Template ID for EC2 instances
 }
-
+/// Get instance ID from queue
+///
+/// Retrieves the next available EC2 instance ID from the queue.
+#[openapi(tag = "EC2")]
 #[get("/get_instance")]
 async fn get_instance_id(state: &State<Mutex<AppState>>) -> Result<String, &'static str> {
     let state = state.lock().await;
@@ -26,11 +31,9 @@ async fn get_instance_id(state: &State<Mutex<AppState>>) -> Result<String, &'sta
         .await
         .expect("Failed to connect to Redis");
 
-    let instance_id: Result<_, redis::RedisError> = conn
-        .lpop("ec2_instance_queue", None).await;
+    let instance_id: Result<_, redis::RedisError> = conn.lpop("ec2_instance_queue", None).await;
 
     println!("{:#?}", instance_id);
-        
 
     if let Ok(Some(id)) = instance_id {
         // Asynchronously create and enqueue a new instance
@@ -141,5 +144,28 @@ async fn rocket() -> _ {
             desired_queue_size: desired_queue_size.try_into().unwrap(),
             launch_template_id,
         }))
-        .mount("/", routes![get_instance_id])
+        .mount("/", openapi_get_routes![get_instance_id])
+        .mount(
+            "/swagger-ui/",
+            make_swagger_ui(&SwaggerUIConfig {
+                url: "../openapi.json".to_owned(),
+                ..Default::default()
+            }),
+        )
+        .mount(
+            "/rapidoc/",
+            make_rapidoc(&RapiDocConfig {
+                general: GeneralConfig {
+                    spec_urls: vec![UrlObject::new("General", "../openapi.json")],
+                    ..Default::default()
+                },
+                hide_show: HideShowConfig {
+                    allow_spec_url_load: false,
+                    allow_spec_file_load: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        )
 }
+
