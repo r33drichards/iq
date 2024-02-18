@@ -9,8 +9,6 @@ use rusoto_core::Region;
 use rusoto_ec2::{Ec2, Ec2Client, RunInstancesRequest};
 use std::env;
 use tokio::sync::Mutex;
-// Make sure to import NonZeroUsize at the top of your file
-use std::num::NonZeroUsize;
 
 struct AppState {
     ec2_client: Ec2Client,
@@ -28,12 +26,13 @@ async fn get_instance_id(state: &State<Mutex<AppState>>) -> Result<String, &'sta
         .await
         .expect("Failed to connect to Redis");
 
-    let instance_id: Option<String> = conn
-        .lpop("ec2_instance_queue", NonZeroUsize::new(1))
-        .await
-        .expect("Failed to pop from Redis");
+    let instance_id: Result<_, redis::RedisError> = conn
+        .lpop("ec2_instance_queue", None).await;
 
-    if let Some(id) = instance_id {
+    println!("{:#?}", instance_id);
+        
+
+    if let Ok(Some(id)) = instance_id {
         // Asynchronously create and enqueue a new instance
         let current_size: usize = conn
             .llen("ec2_instance_queue")
@@ -61,6 +60,7 @@ async fn create_and_enqueue_ec2_instance(
     let request = RunInstancesRequest {
         launch_template: Some(rusoto_ec2::LaunchTemplateSpecification {
             launch_template_id: Some(launch_template_id),
+            version: Some("$Latest".to_string()),
             ..Default::default()
         }),
         max_count: 1,
