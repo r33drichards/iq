@@ -3,14 +3,21 @@ extern crate rocket;
 use dotenv::dotenv;
 use redis::AsyncCommands;
 use redis::Commands;
+use rocket::serde::json::Json;
+
 use rocket::State;
-use rocket_okapi::{openapi, openapi_get_routes, rapidoc::*, swagger_ui::*};
-use rocket_okapi::swagger_ui::make_swagger_ui;
 use rocket_okapi::settings::UrlObject;
+use rocket_okapi::okapi::schemars::JsonSchema;
+
+use rocket_okapi::swagger_ui::make_swagger_ui;
+use rocket_okapi::{openapi, openapi_get_routes, rapidoc::*, swagger_ui::*};
 use rusoto_core::Region;
 use rusoto_ec2::{Ec2, Ec2Client, RunInstancesRequest};
 use std::env;
 use tokio::sync::Mutex;
+
+use rocket::serde::{ Serialize, Deserialize};
+mod error;
 
 struct AppState {
     ec2_client: Ec2Client,
@@ -18,12 +25,20 @@ struct AppState {
     desired_queue_size: usize,
     launch_template_id: String, // Launch Template ID for EC2 instances
 }
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct GetInstance {
+    instance_id: String,
+}
+
+pub type OResult<T> = std::result::Result<rocket::serde::json::Json<T>, error::Error>;
+
 /// Get instance ID from queue
 ///
 /// Retrieves the next available EC2 instance ID from the queue.
-#[openapi(tag = "EC2")]
+#[openapi]
 #[get("/get_instance")]
-async fn get_instance_id(state: &State<Mutex<AppState>>) -> Result<String, &'static str> {
+async fn get_instance_id(state: &State<Mutex<AppState>>) -> OResult<GetInstance>{
     let state = state.lock().await;
     let client = redis::Client::open(state.redis_url.clone()).expect("Invalid Redis URL");
     let mut conn = client
@@ -32,8 +47,6 @@ async fn get_instance_id(state: &State<Mutex<AppState>>) -> Result<String, &'sta
         .expect("Failed to connect to Redis");
 
     let instance_id: Result<_, redis::RedisError> = conn.lpop("ec2_instance_queue", None).await;
-
-    println!("{:#?}", instance_id);
 
     if let Ok(Some(id)) = instance_id {
         // Asynchronously create and enqueue a new instance
@@ -49,9 +62,13 @@ async fn get_instance_id(state: &State<Mutex<AppState>>) -> Result<String, &'sta
             ));
         }
 
-        Ok(id)
+     Ok(Json(GetInstance { instance_id: id }))
     } else {
-        Err("No instance ID available")
+        Err(error::Error{
+            err: "No instances available".to_string(),
+            msg: None,
+            http_status_code: 404,
+        })
     }
 }
 
@@ -60,6 +77,7 @@ async fn create_and_enqueue_ec2_instance(
     redis_client: redis::Client,
     launch_template_id: String,
 ) {
+    let instance_name  = env::var("INSTANCE_NAME").unwrap_or_else(|_| "nix".to_string());
     let request = RunInstancesRequest {
         launch_template: Some(rusoto_ec2::LaunchTemplateSpecification {
             launch_template_id: Some(launch_template_id),
@@ -68,7 +86,15 @@ async fn create_and_enqueue_ec2_instance(
         }),
         max_count: 1,
         min_count: 1,
+        tag_specifications: Some(vec![rusoto_ec2::TagSpecification {
+            resource_type: Some("instance".to_string()),
+            tags: Some(vec![rusoto_ec2::Tag {
+                key: Some("Name".to_string()),
+                value: Some(instance_name),
+            }]),
+        }]),
         ..Default::default()
+
     };
     let res = ec2_client
         .run_instances(request)
@@ -98,7 +124,7 @@ async fn rocket() -> _ {
     let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://0.0.0.0:6379".to_string());
     let ec2_client = Ec2Client::new(Region::default());
     let desired_queue_size: i32 = env::var("DESIRED_QUEUE_SIZE")
-        .unwrap_or_else(|_| "1".to_string())
+        .unwrap_or_else(|_| "3".to_string())
         .parse()
         .expect("DESIRED_QUEUE_SIZE must be a valid number");
     let launch_template_id =
@@ -138,6 +164,11 @@ async fn rocket() -> _ {
     }
 
     rocket::build()
+        .configure(rocket::Config {
+            address: "0.0.0.0".parse().expect("valid IP address"),
+            port: 8000,
+            ..rocket::Config::default()
+        })
         .manage(Mutex::new(AppState {
             ec2_client,
             redis_url,
@@ -168,4 +199,3 @@ async fn rocket() -> _ {
             }),
         )
 }
-

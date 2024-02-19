@@ -51,6 +51,7 @@ dependencies = [
  "rocket_okapi",
  "rusoto_core",
  "rusoto_ec2",
+ "schemars",
  "serde",
  "serde_json",
  "tokio",

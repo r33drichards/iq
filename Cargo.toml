@@ -17,3 +17,6 @@ serde_json = "1.0"
 dotenv = "0.15.0"
 tokio-sync = "0.1.8"
 rocket_okapi = { version = "0.8.0", features = [ "swagger", "rapidoc" ] }
+schemars = { version = "0.8"  }
+
+
