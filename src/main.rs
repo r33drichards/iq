@@ -1,8 +1,7 @@
 #[macro_use]
 extern crate rocket;
 use dotenv::dotenv;
-use redis::AsyncCommands;
-use redis::Commands;
+
 use rocket::serde::json::Json;
 
 use rocket::State;
@@ -11,8 +10,12 @@ use rocket_okapi::okapi::schemars::JsonSchema;
 
 use rocket_okapi::swagger_ui::make_swagger_ui;
 use rocket_okapi::{openapi, openapi_get_routes, rapidoc::*, swagger_ui::*};
+use rusoto_autoscaling::Autoscaling;
 use rusoto_core::Region;
-use rusoto_ec2::{Ec2, Ec2Client, RunInstancesRequest};
+use rusoto_ec2::{CreateLaunchTemplateRequest, Ec2, Ec2Client, RequestLaunchTemplateData};
+use rusoto_elbv2::Elb;
+use rusoto_route53::Route53;
+
 use std::env;
 use tokio::sync::Mutex;
 
@@ -21,15 +24,41 @@ mod error;
 
 struct AppState {
     ec2_client: Ec2Client,
-    redis_url: String,
-    desired_queue_size: usize,
-    launch_template_id: String, // Launch Template ID for EC2 instances
+    as_client: rusoto_autoscaling::AutoscalingClient,
+    elb_client: rusoto_elbv2::ElbClient,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
-struct GetInstance {
-    instance_id: String,
+struct File {
+    content: String,
+    path: String,
 }
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct DeployAWSInput {
+    instance_type: String,
+    flake_url: String,
+    files: Option<Vec<File>>,
+    subdomain_prefix: String,
+    min_size: Option<i64>,
+    max_size: Option<i64>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+struct DeployAWSOutput {
+    id: String,
+    launch_template_id: Option<String>,
+}
+
+impl DeployAWSOutput {
+    fn new() -> Self {
+        Self {
+            id: "todo".to_string(),
+            launch_template_id: None,
+        }
+    }
+}
+
 
 pub type OResult<T> = std::result::Result<rocket::serde::json::Json<T>, error::Error>;
 
@@ -37,131 +66,254 @@ pub type OResult<T> = std::result::Result<rocket::serde::json::Json<T>, error::E
 ///
 /// Retrieves the next available EC2 instance ID from the queue.
 #[openapi]
-#[get("/get_instance")]
-async fn get_instance_id(state: &State<Mutex<AppState>>) -> OResult<GetInstance>{
+#[post("/deploy/aws/create", data = "<input>")]
+async fn get_instance_id(state: &State<Mutex<AppState>>, input: Json<DeployAWSInput>) -> OResult<DeployAWSOutput>{
     let state = state.lock().await;
-    let client = redis::Client::open(state.redis_url.clone()).expect("Invalid Redis URL");
-    let mut conn = client
-        .get_async_connection()
-        .await
-        .expect("Failed to connect to Redis");
+    let ec2_client = &state.ec2_client;
+    let mut output = DeployAWSOutput::new();
 
-    let instance_id: Result<_, redis::RedisError> = conn.lpop("ec2_instance_queue", None).await;
+    let launch_template_data = RequestLaunchTemplateData {
+        image_id: Some("ami-abcdefgh".to_string()),
+        instance_type: Some("t2.micro".to_string()),
+        key_name: Some("my-key-pair".to_string()),
+        // Add other parameters here as needed
+        ..Default::default()
+    };
 
-    if let Ok(Some(id)) = instance_id {
-        // Asynchronously create and enqueue a new instance
-        let current_size: usize = conn
-            .llen("ec2_instance_queue")
-            .await
-            .expect("Failed to get queue length");
-        if current_size < state.desired_queue_size {
-            tokio::spawn(create_and_enqueue_ec2_instance(
-                state.ec2_client.clone(),
-                client,
-                state.launch_template_id.clone(),
-            ));
+    let create_launch_template_req = CreateLaunchTemplateRequest {
+        launch_template_name: "MyLaunchTemplate".to_string(),
+        version_description: Some("MyFirstVersion".to_string()),
+        launch_template_data: launch_template_data,
+        // Include any other needed fields
+        ..Default::default()
+    };
+
+    let resp = ec2_client.create_launch_template(create_launch_template_req).await;
+    match resp {
+        Ok(res) => {
+            println!("Launch template created: {:?}", res);
+            output.launch_template_id = Some(res.launch_template.into_iter().next().unwrap().launch_template_id.unwrap());
+            
         }
-
-     Ok(Json(GetInstance { instance_id: id }))
-    } else {
-        Err(error::Error{
-            err: "No instances available".to_string(),
-            msg: None,
-            http_status_code: 404,
-        })
+        Err(e) => {
+           return Err(error::Error::new("LaunchTemplateCreationFailed", Some(&e.to_string()), 500));
+        }
     }
-}
 
-async fn create_and_enqueue_ec2_instance(
-    ec2_client: Ec2Client,
-    redis_client: redis::Client,
-    launch_template_id: String,
-) {
-    let instance_name  = env::var("INSTANCE_NAME").unwrap_or_else(|_| "nix".to_string());
-    let request = RunInstancesRequest {
-        launch_template: Some(rusoto_ec2::LaunchTemplateSpecification {
-            launch_template_id: Some(launch_template_id),
-            version: Some("$Latest".to_string()),
+
+    let as_client = &state.as_client;
+
+    // create auto scaling group
+    let create_asg_req = rusoto_autoscaling::CreateAutoScalingGroupType {
+        auto_scaling_group_name: "todo".to_string(),
+        launch_template: Some(rusoto_autoscaling::LaunchTemplateSpecification {
+            launch_template_id: Some("todo".to_string()),
+            version: Some("todo".to_string()),
             ..Default::default()
         }),
-        max_count: 1,
-        min_count: 1,
-        tag_specifications: Some(vec![rusoto_ec2::TagSpecification {
-            resource_type: Some("instance".to_string()),
-            tags: Some(vec![rusoto_ec2::Tag {
-                key: Some("Name".to_string()),
-                value: Some(instance_name),
-            }]),
-        }]),
+        min_size: input.min_size.unwrap_or(1),
+        max_size: input.max_size.unwrap_or(1),
+        // desired_capacity: 1,
+        // Add other parameters here as needed
         ..Default::default()
-
     };
-    let res = ec2_client
-        .run_instances(request)
-        .await
-        .expect("Failed to create EC2 instance");
 
-    if let Some(instances) = res.instances {
-        for instance in instances {
-            if let Some(instance_id) = instance.instance_id {
-                let mut conn = redis_client
-                    .get_async_connection()
-                    .await
-                    .expect("Failed to connect to Redis");
-                let _: () = conn
-                    .lpush("ec2_instance_queue", &instance_id)
-                    .await
-                    .expect("Failed to push to Redis");
-            }
+    let resp = as_client.create_auto_scaling_group(create_asg_req).await;
+
+    match resp {
+        Ok(output) => {
+            println!("Auto scaling group created: {:?}", output);
+        }
+        Err(e) => {
+            return Err(error::Error::new("AutoScalingGroupCreationFailed", Some(&e.to_string()), 500));
         }
     }
+
+    let vpcs = ec2_client.describe_vpcs(
+        // filter to default VPC
+        rusoto_ec2::DescribeVpcsRequest {
+            filters: Some(vec![rusoto_ec2::Filter {
+                name: Some("isDefault".to_string()),
+                values: Some(vec!["true".to_string()]),
+            }]),
+            ..Default::default()
+        },
+    ).await;
+
+    let vpc_id = match vpcs {
+        Ok(vpcs) => {
+            vpcs.vpcs.unwrap().into_iter().next().unwrap().vpc_id.unwrap()
+        }
+        Err(e) => {
+            return Err(error::Error::new("VPCFetchFailed", Some(&e.to_string()), 500));
+        }
+    };
+
+    let subnets = ec2_client.describe_subnets(
+        rusoto_ec2::DescribeSubnetsRequest {
+            filters: Some(vec![rusoto_ec2::Filter {
+                name: Some("vpc-id".to_string()),
+                values: Some(vec![vpc_id.clone()]),
+            }]),
+            ..Default::default()
+        },
+    ).await;
+
+
+    // create target group
+    let elb_client = &state.elb_client;
+
+    let create_target_group_req = rusoto_elbv2::CreateTargetGroupInput {
+        name: "todo".to_string(),
+        protocol: Some("HTTP".to_string()),
+        port: Some(8000),
+        vpc_id: Some(vpc_id.clone()),
+        // Add other parameters here as needed
+        ..Default::default()
+    };
+
+    let resp = elb_client.create_target_group(create_target_group_req).await;
+    
+
+
+    match resp {
+        Ok(output) => {
+            println!("Target group created: {:?}", output);
+        }
+        Err(e) => {
+            return Err(error::Error::new("TargetGroupCreationFailed", Some(&e.to_string()), 500));
+        }
+    }
+
+    // create load balancer
+    let create_lb_req = rusoto_elbv2::CreateLoadBalancerInput {
+        name: "todo".to_string(),
+        subnets: Some(subnets.unwrap().subnets.unwrap().into_iter().map(|s| s.subnet_id.unwrap()).collect()),
+        security_groups: None, // todo add security group
+        // Add other parameters here as needed
+        ..Default::default()
+    };
+
+
+    let resp = elb_client.create_load_balancer(create_lb_req).await;
+
+
+    match resp {
+        Ok(output) => {
+            println!("Load balancer created: {:?}", output);
+        }
+        Err(e) => {
+            return Err(error::Error::new("LoadBalancerCreationFailed", Some(&e.to_string()), 500));
+        }
+    }
+
+    // todo wait for load balancer to be ready
+
+    // create listener
+
+    let create_listener_req = rusoto_elbv2::CreateListenerInput {
+        default_actions: vec![rusoto_elbv2::Action {
+            target_group_arn: Some("todo".to_string()),
+            type_: "forward".to_string(),
+            ..Default::default()
+
+        }],
+        load_balancer_arn: "todo".to_string(),
+        port: Some(80),
+        protocol: Some("HTTP".to_string()),
+        // Add other parameters here as needed
+        ..Default::default()
+    };
+
+    let resp = elb_client.create_listener(create_listener_req).await;
+
+    match resp {
+        Ok(output) => {
+            println!("Listener created: {:?}", output);
+        }
+        Err(e) => {
+            return Err(error::Error::new("ListenerCreationFailed", Some(&e.to_string()), 500));
+        }
+    }
+
+    // attach target group to auto scaling group
+
+    let attach_tg_req = rusoto_autoscaling::AttachLoadBalancerTargetGroupsType {
+        auto_scaling_group_name: "todo".to_string(),
+        target_group_ar_ns: vec!["todo".to_string()],
+        // Add other parameters here as needed
+        ..Default::default()
+    };
+
+    let resp = as_client.attach_load_balancer_target_groups(attach_tg_req).await;
+
+    match resp {
+        Ok(output) => {
+            println!("Target group attached: {:?}", output);
+        }
+        Err(e) => {
+            return Err(error::Error::new("TargetGroupAttachFailed", Some(&e.to_string()), 500));
+        }
+    }
+
+    // create an A record in aws to match load balancer dns name to subdomain
+
+    // create a route53 record set
+    let record_set = rusoto_route53::ResourceRecordSet {
+        name: "todo".to_string(),
+        type_: "A".to_string(),
+        alias_target: Some(rusoto_route53::AliasTarget {
+            dns_name: "todo".to_string(),
+            evaluate_target_health: true,
+            hosted_zone_id: "todo".to_string(),
+        }),
+        // Add other parameters here as needed
+        ..Default::default()
+    };
+
+    let change = rusoto_route53::Change {
+        action: "CREATE".to_string(),
+        resource_record_set: record_set,
+    };
+
+    let change_batch = rusoto_route53::ChangeBatch {
+        changes:vec![change],
+        comment: None,
+    };
+
+    let change_resource_record_sets_req = rusoto_route53::ChangeResourceRecordSetsRequest {
+        change_batch: change_batch,
+        hosted_zone_id: "todo".to_string(),
+    };
+
+    let route53_client = rusoto_route53::Route53Client::new(Region::default());
+
+    let resp = route53_client.change_resource_record_sets(change_resource_record_sets_req).await;
+
+    match resp {
+        Ok(output) => {
+            println!("Record set created: {:?}", output);
+        }
+        Err(e) => {
+            return Err(error::Error::new("RecordSetCreationFailed", Some(&e.to_string()), 500));
+        }
+    }
+
+    Ok(Json(output))
+
+
+
 }
+
+
 
 #[launch]
 async fn rocket() -> _ {
     dotenv().ok();
 
-    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://0.0.0.0:6379".to_string());
     let ec2_client = Ec2Client::new(Region::default());
-    let desired_queue_size: i32 = env::var("DESIRED_QUEUE_SIZE")
-        .unwrap_or_else(|_| "3".to_string())
-        .parse()
-        .expect("DESIRED_QUEUE_SIZE must be a valid number");
-    let launch_template_id =
-        env::var("LAUNCH_TEMPLATE_ID").unwrap_or_else(|_| "lt-0d7b76529ceabcb50".to_string());
-    // todo seed queue to desired size if less than desired size
-    // or reduce queue to desired size if greater than desired size
-    let client = redis::Client::open(redis_url.clone()).expect("Invalid Redis URL");
-    let mut conn = client.get_connection().expect("Failed to connect to Redis");
-    let current_queue_size: i32 = conn
-        .llen("ec2_instance_queue")
-        .expect("Failed to get queue length");
-    let instances_to_create = desired_queue_size - current_queue_size;
-
-    match instances_to_create {
-        0 => println!("Queue is already at desired size"),
-        n if n > 0 => {
-            println!(
-                "Queue is smaller than desired size, creating {} instances",
-                n
-            );
-            for _ in 0..instances_to_create {
-                create_and_enqueue_ec2_instance(
-                    ec2_client.clone(),
-                    client.clone(),
-                    launch_template_id.clone(),
-                )
-                .await;
-            }
-        }
-        n if n < 0 => {
-            println!(
-                "Queue is larger than desired size, removing {} instances",
-                n
-            );
-        }
-        _ => println!("Queue is already at desired size"),
-    }
+    let as_client = rusoto_autoscaling::AutoscalingClient::new(Region::default());
+    let elb_client = rusoto_elbv2::ElbClient::new(Region::default());
 
     rocket::build()
         .configure(rocket::Config {
@@ -171,9 +323,9 @@ async fn rocket() -> _ {
         })
         .manage(Mutex::new(AppState {
             ec2_client,
-            redis_url,
-            desired_queue_size: desired_queue_size.try_into().unwrap(),
-            launch_template_id,
+            as_client,
+            elb_client,
+
         }))
         .mount("/", openapi_get_routes![get_instance_id])
         .mount(

@@ -19,6 +19,17 @@ pub struct Error {
     pub http_status_code: u16,
 }
 
+impl Error {
+    /// Create a new error message
+    pub fn new(err: &str, msg: Option<&str>, http_status_code: u16) -> Self {
+        Self {
+            err: err.to_owned(),
+            msg: msg.map(|s| s.to_owned()),
+            http_status_code,
+        }
+    }
+}
+
 impl OpenApiResponderInner for Error {
     fn responses(_generator: &mut OpenApiGenerator) -> Result<Responses, OpenApiError> {
         use rocket_okapi::okapi::openapi3::{RefOr, Response as OpenApiReponse};
