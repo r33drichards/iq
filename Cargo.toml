@@ -21,5 +21,12 @@ dotenv = "0.15.0"
 tokio-sync = "0.1.8"
 rocket_okapi = { version = "0.8.0", features = [ "swagger", "rapidoc" ] }
 schemars = { version = "0.8"  }
-
+base64 = "0.22.0"
+[dependencies.uuid]
+version = "1.8.0"
+features = [
+    "v4",                # Lets you generate random UUIDs
+    "fast-rng",          # Use a faster (but still sufficiently random) RNG
+    "macro-diagnostics", # Enable better diagnostics for compile-time UUIDs
+]
 

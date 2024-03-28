@@ -13,7 +13,7 @@ use rocket_okapi::{openapi, openapi_get_routes, rapidoc::*, swagger_ui::*};
 use rusoto_autoscaling::Autoscaling;
 use rusoto_core::Region;
 use rusoto_ec2::{CreateLaunchTemplateRequest, Ec2, Ec2Client, RequestLaunchTemplateData};
-use rusoto_elbv2::{CreateTargetGroupError, CreateTargetGroupOutput, Elb};
+use rusoto_elbv2::Elb;
 use rusoto_route53::Route53;
 
 use std::env;
@@ -22,19 +22,25 @@ use tokio::sync::Mutex;
 use rocket::serde::{Deserialize, Serialize};
 mod error;
 
+use uuid::Uuid;
+// use base64::prelude::*;
+use base64::{engine::general_purpose::URL_SAFE, Engine as _};
+
+// let id = Uuid::new_v4();
+
 struct AppState {
     ec2_client: Ec2Client,
     as_client: rusoto_autoscaling::AutoscalingClient,
     elb_client: rusoto_elbv2::ElbClient,
 }
 
-#[derive(Serialize, Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize, JsonSchema, Clone)]
 struct File {
     content: String,
     path: String,
 }
 
-#[derive(Serialize, Deserialize, JsonSchema, Clone)]
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Default)]
 struct Target {
     port: i64,
     health_check_path: Option<String>,
@@ -46,7 +52,7 @@ struct Tarn {
     arn: String,
 }
 
-#[derive(Serialize, Deserialize, JsonSchema)]
+#[derive(Serialize, Deserialize, JsonSchema, Clone)]
 struct DeployAWSInput {
     flake_url: String,
     instance_type: String,
@@ -61,16 +67,26 @@ struct DeployAWSInput {
 #[derive(Serialize, Deserialize, JsonSchema)]
 struct DeployAWSOutput {
     id: String,
+    input: DeployAWSInput
 }
 
 impl DeployAWSOutput {
-    fn new() -> Self {
-        Self { id: todo!() }
+    fn new(input: DeployAWSInput ) -> Self {
+        Self {
+             id: Uuid::new_v4().to_string(),
+             input: input,
+            }
     }
 }
 
 pub type OResult<T> = std::result::Result<rocket::serde::json::Json<T>, error::Error>;
 
+
+fn get_dir_path(fpath: &str) -> String {
+    let mut parts = fpath.split('/').collect::<Vec<&str>>();
+    parts.pop();
+    parts.join("/").to_string()
+}
 /// Get instance ID from queue
 ///
 /// Retrieves the next available EC2 instance ID from the queue.
@@ -82,12 +98,28 @@ async fn get_instance_id(
 ) -> OResult<DeployAWSOutput> {
     let state = state.lock().await;
     let ec2_client = &state.ec2_client;
-    let mut output = DeployAWSOutput::new();
+    let output = DeployAWSOutput::new(input.0.clone());
 
     let launch_template_data = RequestLaunchTemplateData {
-        image_id: todo!(),
+        image_id: Some("ami-0e94c086e49480566".to_string()),
         instance_type: Some(input.instance_type.clone()),
-        user_data: todo!(),
+        user_data: {
+            let mut user_data = "#!/bin/bash\n".to_string();
+            input.files.as_ref().unwrap_or(
+                &vec![]
+            ).clone().iter().for_each(|f| {
+               let dirpath = get_dir_path(&f.path);
+     
+                user_data
+                    .push_str(format!(
+                        "mkdir -p {} && echo {} | base64 -d > {}",
+                        dirpath,
+                        URL_SAFE.encode(f.content.clone()),
+                        f.path,
+                    ).as_str())
+            });
+            Some(URL_SAFE.encode(user_data).to_string())
+        },
         // Add other parameters here as needed
         ..Default::default()
     };
@@ -146,22 +178,16 @@ async fn get_instance_id(
         }
     }
 
-    let vpc_id = env::var("VPC_ID").expect("VPC_ID must be set");
-    let public_subnets: Vec<String> = env::var("PUBLIC_SUBNETS")
-        .expect("PUBLIC_SUBNETS must be set")
-        .split(",")
-        .map(|s| s.to_string())
-        .collect();
-
+    let vpc_id = "vpc-031c620b47a9ea885".to_string();
+    let public_subnets = vec!["subnet-07789005966d047bf".to_string()];
     // create target group
     let elb_client = &state.elb_client;
 
     let create_target_group_reqs = input
-        .targets
-        .unwrap_or(vec![Target {
+        .targets.as_ref()
+        .unwrap_or(&vec![Target {
             port: 8000,
-            health_check_path: Some("/health".to_string()),
-            health_check_enabled: Some(true),
+            ..Default::default()
         }])
         .iter()
         .map(|t| {
@@ -201,11 +227,10 @@ async fn get_instance_id(
     }
 
     let tarns = input
-        .targets
-        .unwrap_or(vec![Target {
+        .targets.as_ref()
+        .unwrap_or(&vec![Target {
             port: 8000,
-            health_check_path: Some("/health".to_string()),
-            health_check_enabled: Some(true),
+            ..Default::default()
         }])
         .iter()
         .zip(target_group_arns.iter())
@@ -215,34 +240,87 @@ async fn get_instance_id(
         })
         .collect::<Vec<Tarn>>();
 
+    // create security groups
+    let create_sg_req = rusoto_ec2::CreateSecurityGroupRequest {
+        description: "Security group for the deployment".to_string(),
+        group_name: input.deployment_slug.clone(),
+        vpc_id: Some(vpc_id.clone()),
+        // Add other parameters here as needed
+        ..Default::default()
+    };
+
+    let resp = ec2_client.create_security_group(create_sg_req).await;
+    let sg_id = match resp {
+        Ok(output) => {
+            println!("Security group created: {:?}", output);
+            output.group_id.clone()
+        }
+        Err(e) => {
+            return Err(error::Error::new(
+                "SecurityGroupCreationFailed",
+                Some(&e.to_string()),
+                500,
+            ));
+        }
+    };
+    // rusoto_ec2::AuthorizeSecurityGroupIngressRequest {
+    //     group_id:sg_id.clone(),
+    //     // Add other parameters here as needed
+    //     ..Default::default()
+    // };
+
+    let authorize_sg_reqs = input.targets.as_ref().unwrap_or(&vec![Target {
+        port: 8000,
+        ..Default::default()
+    }]).iter().map(|t| {
+        rusoto_ec2::AuthorizeSecurityGroupIngressRequest {
+            group_id: sg_id.clone(),
+            from_port: Some(t.port),
+            to_port: Some(t.port),
+            ip_protocol: Some("TCP".to_string()),
+            cidr_ip: Some("0.0.0.0/0".to_string()),
+            ..Default::default()
+        }}).collect::<Vec<rusoto_ec2::AuthorizeSecurityGroupIngressRequest>>(); 
+
+    for req in authorize_sg_reqs {
+        let resp = ec2_client.authorize_security_group_ingress(req).await;
+
+        match resp {
+            Ok(output) => {
+                println!("Security group ingress rules added: {:?}", output);
+            }
+            Err(e) => {
+                return Err(error::Error::new(
+                    "SecurityGroupIngressRulesAdditionFailed",
+                    Some(&e.to_string()),
+                    500,
+                ));
+            }
+        }
+    }
+
+
+
+
+
     // create load balancer
     let create_lb_req = rusoto_elbv2::CreateLoadBalancerInput {
         name: input.deployment_slug.clone(),
         subnets: Some(public_subnets),
-        security_groups: todo!(), // todo add security group
+        security_groups: Some(vec![sg_id.expect("sg should be set")]), // todo add security group
         // Add other parameters here as needed
         ..Default::default()
     };
 
     let resp = elb_client.create_load_balancer(create_lb_req).await;
 
-    let lb_dns = match resp {
+    let  (lb_dns,load_balancer_arn) = 
+    match resp {
         Ok(output) => {
             println!("Load balancer created: {:?}", output);
-            output.load_balancers.unwrap()[0].dns_name.clone()
-        }
-        Err(e) => {
-            return Err(error::Error::new(
-                "LoadBalancerCreationFailed",
-                Some(&e.to_string()),
-                500,
-            ));
-        }
-    };
-    let load_balancer_arn = match resp {
-        Ok(output) => {
-            println!("Load balancer created: {:?}", output);
-            output.load_balancers.unwrap()[0].load_balancer_arn.clone()
+            let lb_dns = output.load_balancers.as_ref().unwrap()[0].dns_name.clone();
+            let load_balancer_arn = output.load_balancers.as_ref().unwrap()[0].load_balancer_arn.clone();
+            (lb_dns,load_balancer_arn)
         }
         Err(e) => {
             return Err(error::Error::new(
@@ -253,7 +331,51 @@ async fn get_instance_id(
         }
     };
 
-    // todo wait for load balancer to be ready
+
+    // wait for load balancer to be ready
+
+    for _ in 0..100 {
+        let resp = elb_client
+            .describe_load_balancers(rusoto_elbv2::DescribeLoadBalancersInput {
+                load_balancer_arns: Some(vec![load_balancer_arn.clone().unwrap()]),
+                ..Default::default()
+            })
+            .await;
+
+        match resp {
+            Ok(output) => {
+                let state = output.load_balancers.as_ref().unwrap()[0].state.as_ref().unwrap();
+                if let Some(code) = state.code.as_ref() {
+                    if code == "active" {
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                return Err(error::Error::new(
+                    "LoadBalancerStateCheckFailed",
+                    Some(&e.to_string()),
+                    500,
+                ));
+            }
+        }
+        // sleep for 3 seconds
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+
+    // pub struct Certificate {
+    //     /// <p>The Amazon Resource Name (ARN) of the certificate.</p>
+    //     pub certificate_arn: Option<String>,
+    //     /// <p>Indicates whether the certificate is the default certificate. Do not set this value when specifying a certificate as an input. This value is not included in the output when describing a listener, but is included when describing listener certificates.</p>
+    //     pub is_default: Option<bool>,
+    // }
+
+    let certs = vec![
+        rusoto_elbv2::Certificate {
+            certificate_arn: Some("arn:aws:acm:us-east-1:150301572911:certificate/a9eeb414-3b79-4e0f-bc8a-5b04139d0456".to_string()),
+            is_default: Some(true),
+        }
+    ];
 
     // create listener
 
@@ -269,7 +391,7 @@ async fn get_instance_id(
                 load_balancer_arn: load_balancer_arn.clone().unwrap(),
                 port: Some(tarn.target.port),
                 protocol: Some("HTTPS".to_string()),
-                certificates: todo!(),
+                certificates: Some(certs.clone()),
                 ssl_policy: Some("ELBSecurityPolicy-2016-08".to_string()),
                 // Add other parameters here as needed
                 ..Default::default()
@@ -293,7 +415,6 @@ async fn get_instance_id(
             }
         }
     }
-
 
     // attach target group to auto scaling group
     let attach_tg_req = rusoto_autoscaling::AttachLoadBalancerTargetGroupsType {
@@ -332,7 +453,7 @@ async fn get_instance_id(
         alias_target: Some(rusoto_route53::AliasTarget {
             dns_name: lb_dns.clone().unwrap(),
             evaluate_target_health: true,
-            hosted_zone_id: todo!(),
+            hosted_zone_id: "Z03309493AGZOVY2IU47X".to_string(),
         }),
         // Add other parameters here as needed
         ..Default::default()
@@ -350,7 +471,7 @@ async fn get_instance_id(
 
     let change_resource_record_sets_req = rusoto_route53::ChangeResourceRecordSetsRequest {
         change_batch: change_batch,
-        hosted_zone_id: todo!(),
+        hosted_zone_id: "Z03309493AGZOVY2IU47X".to_string(),
     };
 
     let route53_client = rusoto_route53::Route53Client::new(Region::default());
