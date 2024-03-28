@@ -21,7 +21,7 @@
 #!/bin/bash
 
 # Generate a unique deployment slug by extracting the first 6 characters of a UUID
-slug=$(uuidgen | grep -o '^......')
+slug=flakery-$(uuidgen | grep -o '^......')
 
 # Use the generated slug in the curl command with proper string substitution
 curl -X 'POST' \
@@ -40,6 +40,12 @@ curl -X 'POST' \
       \"port\": 8080,
       \"health_check_enabled\": true,
       \"health_check_path\": \"/\"
+    }
+  ],
+  \"files\" : [
+    {
+      \"path\": \"/tsauthkey\",
+      \"content\": \"tskey-key\"
     }
   ]
 }"
