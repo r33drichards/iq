@@ -98,11 +98,23 @@ async fn get_instance_id(
 ) -> OResult<DeployAWSOutput> {
     let state = state.lock().await;
     let ec2_client = &state.ec2_client;
+    println!("Input: {:?}", input.0.clone().deployment_slug);
     let output = DeployAWSOutput::new(input.0.clone());
 
     let launch_template_data = RequestLaunchTemplateData {
         image_id: Some("ami-0e94c086e49480566".to_string()),
+        
         instance_type: Some(input.instance_type.clone()),
+        block_device_mappings: Some(vec![rusoto_ec2::LaunchTemplateBlockDeviceMappingRequest {
+            device_name: Some("/dev/xvda".to_string()),
+            ebs: Some(rusoto_ec2::LaunchTemplateEbsBlockDeviceRequest {
+                volume_size: Some(100),
+                volume_type: Some("gp3".to_string()),
+                delete_on_termination: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }]),
         user_data: {
             let mut user_data = "#!/bin/bash\n".to_string();
             input.files.as_ref().unwrap_or(
@@ -112,12 +124,19 @@ async fn get_instance_id(
      
                 user_data
                     .push_str(format!(
-                        "mkdir -p {} && echo {} | base64 -d > {}",
+                        "mkdir -p {} && echo {} | base64 -d > {}\n",
                         dirpath,
                         URL_SAFE.encode(f.content.clone()),
                         f.path,
                     ).as_str())
             });
+            // err = session.Run(fmt.Sprintf("nixos-rebuild switch --impure --flake '%s'", flake_url))
+            user_data.push_str(format!(
+                "nixos-rebuild switch --impure --flake '{}'\n",
+                input.flake_url
+            ).as_str());
+
+
             Some(URL_SAFE.encode(user_data).to_string())
         },
         // Add other parameters here as needed
@@ -158,6 +177,8 @@ async fn get_instance_id(
         }),
         min_size: input.min_size.unwrap_or(1),
         max_size: input.max_size.unwrap_or(1),
+        vpc_zone_identifier: Some("subnet-07789005966d047bf".to_string()),
+        // availability_zones: Some(vec!["us-west-1a".to_string(), "us-west-1c".to_string()]),
         // desired_capacity: 1,
         // Add other parameters here as needed
         ..Default::default()
@@ -179,7 +200,7 @@ async fn get_instance_id(
     }
 
     let vpc_id = "vpc-031c620b47a9ea885".to_string();
-    let public_subnets = vec!["subnet-07789005966d047bf".to_string()];
+    let public_subnets = vec!["subnet-040ebc679c54ecf38".to_string(), "subnet-0e22657a6f50a3235".to_string()];
     // create target group
     let elb_client = &state.elb_client;
 
@@ -370,12 +391,6 @@ async fn get_instance_id(
     //     pub is_default: Option<bool>,
     // }
 
-    let certs = vec![
-        rusoto_elbv2::Certificate {
-            certificate_arn: Some("arn:aws:acm:us-east-1:150301572911:certificate/a9eeb414-3b79-4e0f-bc8a-5b04139d0456".to_string()),
-            is_default: Some(true),
-        }
-    ];
 
     // create listener
 
@@ -390,9 +405,7 @@ async fn get_instance_id(
                 }],
                 load_balancer_arn: load_balancer_arn.clone().unwrap(),
                 port: Some(tarn.target.port),
-                protocol: Some("HTTPS".to_string()),
-                certificates: Some(certs.clone()),
-                ssl_policy: Some("ELBSecurityPolicy-2016-08".to_string()),
+                protocol: Some("HTTP".to_string()),
                 // Add other parameters here as needed
                 ..Default::default()
             }
@@ -447,14 +460,16 @@ async fn get_instance_id(
     // create an A record in aws to match load balancer dns name to subdomain
 
     // create a route53 record set
+    // {"err":"RecordSetCreationFailed","msg":"Request ID: Some(\"c203136a-5083-4d3b-8b3c-989c978cd68a\") Body: <?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>SignatureDoesNotMatch</Code><Message>Credential should be scoped to a valid region. </Message></Error><RequestId>c203136a-5083-4d3b-8b3c-989c978cd68a</RequestId></ErrorResponse>"}%                                                                                                                                        
     let record_set = rusoto_route53::ResourceRecordSet {
         name: input.subdomain_prefix.clone(),
-        type_: "A".to_string(),
-        alias_target: Some(rusoto_route53::AliasTarget {
-            dns_name: lb_dns.clone().unwrap(),
-            evaluate_target_health: true,
-            hosted_zone_id: "Z03309493AGZOVY2IU47X".to_string(),
-        }),
+        type_: "CNAME".to_string(),
+        ttl: Some(300),
+        region: Some("us-west-1".to_string()), // todo get region from ec2 client
+        resource_records: Some(vec![rusoto_route53::ResourceRecord {
+            value: lb_dns.clone().unwrap(),
+        }]),
+
         // Add other parameters here as needed
         ..Default::default()
     };
@@ -496,15 +511,15 @@ async fn get_instance_id(
     Ok(Json(output))
 }
 
-#[launch]
-async fn rocket() -> _ {
+#[rocket::main]
+async fn main() {
     dotenv().ok();
 
     let ec2_client = Ec2Client::new(Region::default());
     let as_client = rusoto_autoscaling::AutoscalingClient::new(Region::default());
     let elb_client = rusoto_elbv2::ElbClient::new(Region::default());
 
-    rocket::build()
+    let _ = rocket::build()
         .configure(rocket::Config {
             address: "0.0.0.0".parse().expect("valid IP address"),
             port: 8000,
@@ -536,6 +551,6 @@ async fn rocket() -> _ {
                     ..Default::default()
                 },
                 ..Default::default()
-            }),
-        )
+            })).launch().await;
 }
+
