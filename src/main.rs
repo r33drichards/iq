@@ -148,10 +148,23 @@ async fn get_instance_id(
                         ))
                         .build(),
                 ]))
+                .set_block_device_mappings(Some(vec![
+                    aws_sdk_ec2::types::LaunchTemplateBlockDeviceMappingRequest::builder()
+                        .device_name("/dev/sda1")
+                        .ebs(
+                            aws_sdk_ec2::types::LaunchTemplateEbsBlockDeviceRequest::builder()
+                                .volume_size(80)
+                                .volume_type(aws_sdk_ec2::types::VolumeType::Gp2)
+                                .delete_on_termination(true)
+                                .build(),
+                        )
+                        .build(),
+                ]))
                 .build(),
         ))
         .send()
-        .await.map_err(|e| {
+        .await
+        .map_err(|e| {
             error::Error::new("LaunchTemplateCreationFailed", Some(&e.to_string()), 500)
         })?;
 
