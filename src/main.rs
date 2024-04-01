@@ -91,8 +91,12 @@ fn get_tag_data(
 ) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
     let mut tags = HashMap::new();
 
-    let turso_token = std::env::var("TURSO_TOKEN")?;
-    let file_encryption_key = std::env::var("FILE_ENCRYPTION_KEY")?;
+    let turso_token = std::env::var("TURSO_TOKEN").map_err(
+        |e| error::Error::new("TursoTokenCreationFailed", Some(&e.to_string()), 500),
+    )?;
+    let file_encryption_key = std::env::var("FILE_ENCRYPTION_KEY").map_err(
+        |e| error::Error::new("FileEncryptionKeyCreationFailed", Some(&e.to_string()), 500),
+    )?;
     tags.insert("turso_token".to_string(), turso_token);
     tags.insert("file_encryption_key".to_string(), file_encryption_key);
     tags.insert("template_id".to_string(), template_id);
@@ -114,7 +118,8 @@ async fn get_instance_id(
     println!("Input: {:?}", input.0.clone().deployment_slug);
     let output = DeployAWSOutput::new(input.0.clone());
 
-    let tags = get_tag_data(input.template_id.clone(), input.0.flake_url.clone()).unwrap();
+    let tags = get_tag_data(input.template_id.clone(), input.flake_url.clone())
+        .map_err(|e| error::Error::new("TagDataCreationFailed", Some(&e.to_string()), 500))?;
 
     // instead create launch template with ec2_client_ng b/c that has access to
     // the latest version of the api
@@ -179,7 +184,7 @@ async fn get_instance_id(
         }),
         min_size: input.min_size.unwrap_or(1),
         max_size: input.max_size.unwrap_or(1),
-        vpc_zone_identifier: Some("subnet-07789005966d047bf".to_string()),
+        vpc_zone_identifier: Some("subnet-0c762bc5239b282a0".to_string()),
         // availability_zones: Some(vec!["us-west-1a".to_string(), "us-west-1c".to_string()]),
         // desired_capacity: 1,
         // Add other parameters here as needed
