@@ -45,7 +45,7 @@ curl -X 'POST' \
   \"files\" : [
     {
       \"path\": \"/tsauthkey\",
-      \"content\": \"tskey-key\"
+      \"content\": \"`sudo cat /tsauthkey`\"
     }
   ]
 }"

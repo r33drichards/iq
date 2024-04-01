@@ -1,5 +1,6 @@
 #[macro_use]
 extern crate rocket;
+use aws_sdk_ec2::types::{LaunchTemplateInstanceMetadataTagsState, RequestLaunchTemplateData};
 use dotenv::dotenv;
 
 use rocket::serde::json::Json;
@@ -12,7 +13,7 @@ use rocket_okapi::swagger_ui::make_swagger_ui;
 use rocket_okapi::{openapi, openapi_get_routes, rapidoc::*, swagger_ui::*};
 use rusoto_autoscaling::Autoscaling;
 use rusoto_core::Region;
-use rusoto_ec2::{CreateLaunchTemplateRequest, Ec2, Ec2Client, RequestLaunchTemplateData};
+use rusoto_ec2::{Ec2, Ec2Client};
 use rusoto_elbv2::Elb;
 use rusoto_route53::Route53;
 
@@ -23,15 +24,17 @@ use rocket::serde::{Deserialize, Serialize};
 mod error;
 
 use uuid::Uuid;
-// use base64::prelude::*;
-use base64::{engine::general_purpose::URL_SAFE, Engine as _};
 
 // let id = Uuid::new_v4();
+use aws_config::BehaviorVersion;
+
+use std::collections::HashMap;
 
 struct AppState {
     ec2_client: Ec2Client,
     as_client: rusoto_autoscaling::AutoscalingClient,
     elb_client: rusoto_elbv2::ElbClient,
+    ec2_client_ng: aws_sdk_ec2::Client,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema, Clone)]
@@ -62,31 +65,41 @@ struct DeployAWSInput {
     min_size: Option<i64>,
     max_size: Option<i64>,
     targets: Option<Vec<Target>>,
+    template_id: String,
 }
 
 #[derive(Serialize, Deserialize, JsonSchema)]
 struct DeployAWSOutput {
     id: String,
-    input: DeployAWSInput
+    input: DeployAWSInput,
 }
 
 impl DeployAWSOutput {
-    fn new(input: DeployAWSInput ) -> Self {
+    fn new(input: DeployAWSInput) -> Self {
         Self {
-             id: Uuid::new_v4().to_string(),
-             input: input,
-            }
+            id: Uuid::new_v4().to_string(),
+            input: input,
+        }
     }
 }
 
 pub type OResult<T> = std::result::Result<rocket::serde::json::Json<T>, error::Error>;
 
+fn get_tag_data(
+    template_id: String,
+    flake_url: String,
+) -> Result<HashMap<String, String>, Box<dyn std::error::Error>> {
+    let mut tags = HashMap::new();
 
-fn get_dir_path(fpath: &str) -> String {
-    let mut parts = fpath.split('/').collect::<Vec<&str>>();
-    parts.pop();
-    parts.join("/").to_string()
+    let turso_token = std::env::var("TURSO_TOKEN")?;
+    let file_encryption_key = std::env::var("FILE_ENCRYPTION_KEY")?;
+    tags.insert("turso_token".to_string(), turso_token);
+    tags.insert("file_encryption_key".to_string(), file_encryption_key);
+    tags.insert("template_id".to_string(), template_id);
+    tags.insert("flake_url".to_string(), flake_url);
+    Ok(tags)
 }
+
 /// Get instance ID from queue
 ///
 /// Retrieves the next available EC2 instance ID from the queue.
@@ -101,70 +114,46 @@ async fn get_instance_id(
     println!("Input: {:?}", input.0.clone().deployment_slug);
     let output = DeployAWSOutput::new(input.0.clone());
 
-    let launch_template_data = RequestLaunchTemplateData {
-        image_id: Some("ami-0e94c086e49480566".to_string()),
-        
-        instance_type: Some(input.instance_type.clone()),
-        block_device_mappings: Some(vec![rusoto_ec2::LaunchTemplateBlockDeviceMappingRequest {
-            device_name: Some("/dev/xvda".to_string()),
-            ebs: Some(rusoto_ec2::LaunchTemplateEbsBlockDeviceRequest {
-                volume_size: Some(100),
-                volume_type: Some("gp3".to_string()),
-                delete_on_termination: Some(true),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }]),
-        user_data: {
-            let mut user_data = "#!/bin/bash\n".to_string();
-            input.files.as_ref().unwrap_or(
-                &vec![]
-            ).clone().iter().for_each(|f| {
-               let dirpath = get_dir_path(&f.path);
-     
-                user_data
-                    .push_str(format!(
-                        "mkdir -p {} && echo {} | base64 -d > {}\n",
-                        dirpath,
-                        URL_SAFE.encode(f.content.clone()),
-                        f.path,
-                    ).as_str())
-            });
-            // err = session.Run(fmt.Sprintf("nixos-rebuild switch --impure --flake '%s'", flake_url))
-            user_data.push_str(format!(
-                "nixos-rebuild switch --impure --flake '{}'\n",
-                input.flake_url
-            ).as_str());
+    let tags = get_tag_data(input.template_id.clone(), input.0.flake_url.clone()).unwrap();
 
-
-            Some(URL_SAFE.encode(user_data).to_string())
-        },
-        // Add other parameters here as needed
-        ..Default::default()
-    };
-
-    let create_launch_template_req = CreateLaunchTemplateRequest {
-        launch_template_name: input.deployment_slug.clone(),
-        launch_template_data: launch_template_data,
-        // Include any other needed fields
-        ..Default::default()
-    };
-
-    let resp = ec2_client
-        .create_launch_template(create_launch_template_req)
-        .await;
-    match resp {
-        Ok(res) => {
-            println!("Launch template created: {:?}", res);
-        }
-        Err(e) => {
-            return Err(error::Error::new(
-                "LaunchTemplateCreationFailed",
-                Some(&e.to_string()),
-                500,
-            ));
-        }
-    }
+    // instead create launch template with ec2_client_ng b/c that has access to
+    // the latest version of the api
+    state
+        .ec2_client_ng
+        .create_launch_template()
+        .set_launch_template_name(Some(input.deployment_slug.clone()))
+        .set_launch_template_data(Some(
+            RequestLaunchTemplateData::builder()
+                .instance_type(aws_sdk_ec2::types::InstanceType::T3Small)
+                .image_id("ami-0d1d97987c98945a7")
+                .set_metadata_options(Some(
+                    aws_sdk_ec2::types::LaunchTemplateInstanceMetadataOptionsRequest::builder()
+                        .set_instance_metadata_tags(Some(
+                            LaunchTemplateInstanceMetadataTagsState::Enabled,
+                        ))
+                        .build(),
+                ))
+                .set_tag_specifications(Some(vec![
+                    aws_sdk_ec2::types::LaunchTemplateTagSpecificationRequest::builder()
+                        .set_resource_type(Some(aws_sdk_ec2::types::ResourceType::Instance))
+                        .set_tags(Some(
+                            tags.iter()
+                                .map(|(k, v)| {
+                                    aws_sdk_ec2::types::Tag::builder()
+                                        .set_key(Some(k.clone()))
+                                        .set_value(Some(v.clone()))
+                                        .build()
+                                })
+                                .collect(),
+                        ))
+                        .build(),
+                ]))
+                .build(),
+        ))
+        .send()
+        .await.map_err(|e| {
+            error::Error::new("LaunchTemplateCreationFailed", Some(&e.to_string()), 500)
+        })?;
 
     let as_client = &state.as_client;
 
@@ -200,12 +189,16 @@ async fn get_instance_id(
     }
 
     let vpc_id = "vpc-031c620b47a9ea885".to_string();
-    let public_subnets = vec!["subnet-040ebc679c54ecf38".to_string(), "subnet-0e22657a6f50a3235".to_string()];
+    let public_subnets = vec![
+        "subnet-040ebc679c54ecf38".to_string(),
+        "subnet-0e22657a6f50a3235".to_string(),
+    ];
     // create target group
     let elb_client = &state.elb_client;
 
     let create_target_group_reqs = input
-        .targets.as_ref()
+        .targets
+        .as_ref()
         .unwrap_or(&vec![Target {
             port: 8000,
             ..Default::default()
@@ -248,7 +241,8 @@ async fn get_instance_id(
     }
 
     let tarns = input
-        .targets.as_ref()
+        .targets
+        .as_ref()
         .unwrap_or(&vec![Target {
             port: 8000,
             ..Default::default()
@@ -290,18 +284,23 @@ async fn get_instance_id(
     //     ..Default::default()
     // };
 
-    let authorize_sg_reqs = input.targets.as_ref().unwrap_or(&vec![Target {
-        port: 8000,
-        ..Default::default()
-    }]).iter().map(|t| {
-        rusoto_ec2::AuthorizeSecurityGroupIngressRequest {
+    let authorize_sg_reqs = input
+        .targets
+        .as_ref()
+        .unwrap_or(&vec![Target {
+            port: 8000,
+            ..Default::default()
+        }])
+        .iter()
+        .map(|t| rusoto_ec2::AuthorizeSecurityGroupIngressRequest {
             group_id: sg_id.clone(),
             from_port: Some(t.port),
             to_port: Some(t.port),
             ip_protocol: Some("TCP".to_string()),
             cidr_ip: Some("0.0.0.0/0".to_string()),
             ..Default::default()
-        }}).collect::<Vec<rusoto_ec2::AuthorizeSecurityGroupIngressRequest>>(); 
+        })
+        .collect::<Vec<rusoto_ec2::AuthorizeSecurityGroupIngressRequest>>();
 
     for req in authorize_sg_reqs {
         let resp = ec2_client.authorize_security_group_ingress(req).await;
@@ -320,10 +319,6 @@ async fn get_instance_id(
         }
     }
 
-
-
-
-
     // create load balancer
     let create_lb_req = rusoto_elbv2::CreateLoadBalancerInput {
         name: input.deployment_slug.clone(),
@@ -335,13 +330,14 @@ async fn get_instance_id(
 
     let resp = elb_client.create_load_balancer(create_lb_req).await;
 
-    let  (lb_dns,load_balancer_arn) = 
-    match resp {
+    let (lb_dns, load_balancer_arn) = match resp {
         Ok(output) => {
             println!("Load balancer created: {:?}", output);
             let lb_dns = output.load_balancers.as_ref().unwrap()[0].dns_name.clone();
-            let load_balancer_arn = output.load_balancers.as_ref().unwrap()[0].load_balancer_arn.clone();
-            (lb_dns,load_balancer_arn)
+            let load_balancer_arn = output.load_balancers.as_ref().unwrap()[0]
+                .load_balancer_arn
+                .clone();
+            (lb_dns, load_balancer_arn)
         }
         Err(e) => {
             return Err(error::Error::new(
@@ -351,7 +347,6 @@ async fn get_instance_id(
             ));
         }
     };
-
 
     // wait for load balancer to be ready
 
@@ -365,7 +360,10 @@ async fn get_instance_id(
 
         match resp {
             Ok(output) => {
-                let state = output.load_balancers.as_ref().unwrap()[0].state.as_ref().unwrap();
+                let state = output.load_balancers.as_ref().unwrap()[0]
+                    .state
+                    .as_ref()
+                    .unwrap();
                 if let Some(code) = state.code.as_ref() {
                     if code == "active" {
                         break;
@@ -390,7 +388,6 @@ async fn get_instance_id(
     //     /// <p>Indicates whether the certificate is the default certificate. Do not set this value when specifying a certificate as an input. This value is not included in the output when describing a listener, but is included when describing listener certificates.</p>
     //     pub is_default: Option<bool>,
     // }
-
 
     // create listener
 
@@ -460,7 +457,7 @@ async fn get_instance_id(
     // create an A record in aws to match load balancer dns name to subdomain
 
     // create a route53 record set
-    // {"err":"RecordSetCreationFailed","msg":"Request ID: Some(\"c203136a-5083-4d3b-8b3c-989c978cd68a\") Body: <?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>SignatureDoesNotMatch</Code><Message>Credential should be scoped to a valid region. </Message></Error><RequestId>c203136a-5083-4d3b-8b3c-989c978cd68a</RequestId></ErrorResponse>"}%                                                                                                                                        
+    // {"err":"RecordSetCreationFailed","msg":"Request ID: Some(\"c203136a-5083-4d3b-8b3c-989c978cd68a\") Body: <?xml version=\"1.0\"?>\n<ErrorResponse xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\"><Error><Type>Sender</Type><Code>SignatureDoesNotMatch</Code><Message>Credential should be scoped to a valid region. </Message></Error><RequestId>c203136a-5083-4d3b-8b3c-989c978cd68a</RequestId></ErrorResponse>"}%
     let record_set = rusoto_route53::ResourceRecordSet {
         name: input.subdomain_prefix.clone(),
         type_: "CNAME".to_string(),
@@ -518,6 +515,9 @@ async fn main() {
     let ec2_client = Ec2Client::new(Region::default());
     let as_client = rusoto_autoscaling::AutoscalingClient::new(Region::default());
     let elb_client = rusoto_elbv2::ElbClient::new(Region::default());
+    let config = aws_config::load_defaults(BehaviorVersion::v2023_11_09()).await;
+
+    let ec2_client_ng = aws_sdk_ec2::Client::new(&config);
 
     let _ = rocket::build()
         .configure(rocket::Config {
@@ -529,6 +529,7 @@ async fn main() {
             ec2_client,
             as_client,
             elb_client,
+            ec2_client_ng,
         }))
         .mount("/", openapi_get_routes![get_instance_id])
         .mount(
@@ -551,6 +552,8 @@ async fn main() {
                     ..Default::default()
                 },
                 ..Default::default()
-            })).launch().await;
+            }),
+        )
+        .launch()
+        .await;
 }
-
