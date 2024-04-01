@@ -126,3 +126,5 @@ impl From<rocket::serde::json::Error<'_>> for Error {
         }
     }
 }
+
+pub type OResult<T> = std::result::Result<rocket::serde::json::Json<T>, Error>;

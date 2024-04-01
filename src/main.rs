@@ -3,6 +3,7 @@ extern crate rocket;
 use aws_sdk_ec2::types::{LaunchTemplateInstanceMetadataTagsState, RequestLaunchTemplateData};
 use dotenv::dotenv;
 
+use error::OResult;
 use rocket::serde::json::Json;
 
 use rocket::State;
@@ -22,6 +23,7 @@ use tokio::sync::Mutex;
 
 use rocket::serde::{Deserialize, Serialize};
 mod error;
+mod handlers;
 
 use uuid::Uuid;
 
@@ -83,7 +85,6 @@ impl DeployAWSOutput {
     }
 }
 
-pub type OResult<T> = std::result::Result<rocket::serde::json::Json<T>, error::Error>;
 
 fn get_tag_data(
     template_id: String,
@@ -109,7 +110,7 @@ fn get_tag_data(
 /// Retrieves the next available EC2 instance ID from the queue.
 #[openapi]
 #[post("/deploy/aws/create", data = "<input>")]
-async fn get_instance_id(
+async fn deploy_aws_create(
     state: &State<Mutex<AppState>>,
     input: Json<DeployAWSInput>,
 ) -> OResult<DeployAWSOutput> {
@@ -549,7 +550,10 @@ async fn main() {
             elb_client,
             ec2_client_ng,
         }))
-        .mount("/", openapi_get_routes![get_instance_id])
+        .mount("/", openapi_get_routes![
+            deploy_aws_create,
+            handlers::log::log,
+            ])
         .mount(
             "/swagger-ui/",
             make_swagger_ui(&SwaggerUIConfig {
